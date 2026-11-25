@@ -43,7 +43,7 @@ if __name__ == '__main__':
     if a.temperature <= 0 or a.bytes < 0:
         p.error('temperature must be positive and byte count must be nonnegative')
     ck = torch.load(a.checkpoint, map_location='cpu', weights_only=True)
-    model = LM(ck['kind'], ck['slots'])
+    model = LM(ck['kind'], ck['slots'], read_window=ck.get('read_window'), mid_window=ck.get('mid_window'))
     model.load_state_dict(ck['state_dict'])
     model.to(a.device).eval()
     torch.manual_seed(a.seed)

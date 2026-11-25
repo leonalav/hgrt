@@ -110,7 +110,9 @@ class Attention(nn.Module):
         q, k = rotate(q), rotate(k)
         if cache is not None:
             k, v = (torch.cat((a, z), 2) for a, z in zip(cache, (k, v)))
-        if self.window and not streaming:
+        if cache is None and (not self.window or length <= self.window):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif self.window and not streaming:
             # Each block sees the previous and current block, with an exact sliding mask.
             w = self.window
             pad = (-length) % w
@@ -124,10 +126,12 @@ class Attention(nn.Module):
             j = torch.arange(2*w, device=x.device)
             mask = ((i >= j) & (i-j < w)).expand((length+pad)//w, 1, w, 2*w).clone()
             mask[0, :, :, :w] = False
-            y = F.scaled_dot_product_attention(split(q), adjacent(k), adjacent(v), attn_mask=mask)
-            y = y.transpose(1, 2).reshape(b, self.h, -1, self.d)[:, :, :length]
-        elif not self.window and cache is None:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # Batch the windows in 4D so CUDA can dispatch its fused SDPA kernels.
+            query = split(q).reshape(-1, self.h, w, self.d)
+            keys = adjacent(k).reshape(-1, self.h, 2*w, self.d)
+            values = adjacent(v).reshape_as(keys)
+            y = F.scaled_dot_product_attention(query, keys, values, attn_mask=mask.repeat(b, 1, 1, 1))
+            y = y.reshape(b, -1, self.h, w, self.d).transpose(1, 2).reshape(b, self.h, -1, self.d)[:, :, :length]
         else:
             difference = torch.arange(length, device=x.device)[:, None] + k.size(2)-length - torch.arange(k.size(2), device=x.device)
             valid = difference >= 0
@@ -209,7 +213,7 @@ class Block(nn.Module):
 
 
 class LM(nn.Module):
-    def __init__(self, kind='C1', slots=8, s=Shape(), backend='torch'):
+    def __init__(self, kind='C1', slots=8, s=Shape(), backend='torch', read_window=None, mid_window=None):
         super().__init__()
         if kind not in ('A0', 'B1', 'C1'):
             raise ValueError(kind)
@@ -219,6 +223,14 @@ class LM(nn.Module):
         self.norm = nn.RMSNorm(s.width, eps=1e-5)
         mixers = [Attention(s, kind != 'A0') if kind == 'A0' or i in (3, 7)
                   else Delta(s, backend) for i in range(8)]
+        if read_window is not None:
+            if kind != 'C1' or read_window < s.chunk:
+                raise ValueError('read_window requires C1 and at least one full chunk')
+            mixers[-1].window = read_window
+        if mid_window is not None:
+            if kind != 'C1' or mid_window < s.chunk:
+                raise ValueError('mid_window requires C1 and at least one full chunk')
+            mixers[3].window = mid_window
         # Centre the shared B1/C1 width between the two parameter counts.
         fixed = sum(p.numel() for module in [self.embed, self.norm, *mixers] for p in module.parameters()) + 16*s.width
         tree_mid = (s.width*s.slot_dim + s.slot_dim**2 + 16*s.slot_dim + 1)/2 if kind != 'A0' else 0
@@ -235,7 +247,10 @@ class LM(nn.Module):
             if i == 3:
                 source = x
         if positions is not None:
-            x = x.index_select(1, positions)
+            if positions.ndim == 1:
+                x = x.index_select(1, positions)
+            else:
+                x = x[torch.arange(x.size(0), device=x.device)[:, None], positions]
         return F.linear(self.norm(x), self.embed.weight)
 
     def stream_chunk(self, tokens, state=None):
