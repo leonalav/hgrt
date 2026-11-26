@@ -1,6 +1,10 @@
 """Sync embedded module cells (model.py, dialogue.py, fact_switch.py) and upgraded pipeline cells into run.ipynb."""
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from phase0_cell import PHASE0_CODE
 
 
 def to_lines(text: str) -> list[str]:
@@ -115,6 +119,59 @@ assert DIALOGUE_CONTEXT >= 512 and DIALOGUE_CONTEXT % 64 == 0
 assert QA_PROMPT_STYLE in ('qa', 'role')
 assert MAX_UPDATES is None or MAX_UPDATES >= 1
 assert not (INITIAL_WEIGHTS and RESUME_FROM)
+"""
+
+COLAB_CLEANUP_CODE = '''
+"""One-time Colab cleanup - run this ONCE, before anything else.
+
+Colab autosaves your notebook into `My Drive/Colab Notebooks/` and can restore that
+copy over your edits when you reopen it. Archiving the stale copy removes the
+rollback permanently. Originals are kept as `*.colab-backup`.
+"""
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    import shutil, os, glob
+    stale = glob.glob('/content/drive/MyDrive/Colab Notebooks/*.ipynb')
+    if not stale:
+        print('No Drive notebook copies found - nothing to clean up. (Safe to continue.)')
+    for p in stale:
+        backup = p + '.colab-backup'
+        if os.path.exists(backup):
+            os.remove(p)
+            print('removed stale copy (backup already existed):', p)
+        else:
+            shutil.copy2(p, backup)
+            os.remove(p)
+            print('archived stale copy:', p, '->', backup)
+    print()
+    print('Done. From now on: File -> Open notebook -> GitHub -> leonalav/hgrt -> run.ipynb')
+except ImportError:
+    print('Not running in Colab - skipping cleanup (no-op).')
+except Exception as exc:
+    print('Cleanup skipped:', exc)
+    print('You can continue; just always open the notebook from GitHub, not from Drive.')
+'''
+
+COLAB_INTRO_MD = """
+# HGRT-10M - Colab notebook
+
+> **Before your first run on Colab:** run the *"One-time Colab cleanup"* code cell
+> just below. It archives the stale Drive copy that Colab keeps restoring over your
+> edits, so your GitHub version is never rolled back again.
+>
+> **After that:** always re-open this notebook from GitHub
+> (*File -> Open notebook -> GitHub -> `leonalav/hgrt` -> `run.ipynb`*),
+> **never** from `My Drive/Colab Notebooks/`. Colab's Drive copy is autosave scratch
+> space and will contain stale cells.
+>
+> **Never edit cells in the Colab UI.** Edit the `.py` files locally, run
+> `python sync_notebook.py`, commit, push. The notebook embeds `model.py`,
+> `dialogue.py` and `fact_switch.py` verbatim, so it runs standalone with no
+> external files on disk.
+>
+> Full details: see `COLAB_ROLLBACK_FIX.md` in the repository.
 """
 
 DIALOG_INTRO_MD = """
@@ -667,6 +724,68 @@ def sync(root: Path | None = None):
 
     by_id('dialog-intro')['source'] = to_lines(DIALOG_INTRO_MD)
 
+    # ---- Colab rollback guards (owned here so they survive every re-sync) ----
+    c_intro = by_id('82ee9c05')
+    c_intro['cell_type'] = 'markdown'
+    c_intro['source'] = to_lines(COLAB_INTRO_MD)
+    c_intro.pop('outputs', None)
+    c_intro.pop('execution_count', None)
+
+    c_cleanup = make_cell('code', '50b46b5a', COLAB_CLEANUP_CODE)
+
+    # Bootstrap: re-run the settings cell when it has not been executed yet.
+    c_setup = by_id('4761bdeb')
+    setup_src = ''.join(c_setup['source'])
+    if 'bootstrapping it now' not in setup_src:
+        setup_src = setup_src.replace(
+            "import contextlib, gc, hashlib, importlib, importlib.metadata, importlib.util, json\n"
+            "import os, shutil, statistics, subprocess, sys, tempfile, time\n",
+            "import contextlib, gc, hashlib, importlib, importlib.metadata, importlib.util, json\n"
+            "import os, shutil, statistics, subprocess, sys, tempfile, time\n"
+            "\n"
+            "# Bootstrap: if this cell is run before \"Run settings\", re-execute it so the\n"
+            "# notebook works even when individual cells are executed out of order.\n"
+            "if 'DEVICE' not in globals() or 'CONTEXT' not in globals():\n"
+            "    print('Run settings cell was not executed; bootstrapping it now.')\n"
+            "    _nb = globals().get('__nb__')\n"
+            "    if _nb is not None:\n"
+            "        try:\n"
+            "            exec(''.join(_nb.cells[3].source), globals())\n"
+            "        except Exception as exc:\n"
+            "            raise RuntimeError(\n"
+            "                'Could not auto-run the \"Run settings\" cell. '\n"
+            "                'Restart the runtime and run all cells from the top.'\n"
+            "            ) from exc\n"
+            "    else:\n"
+            "        raise RuntimeError(\n"
+            "            'The \"Run settings\" cell has not been executed. '\n"
+            "            'Restart the runtime and run all cells from the top.'\n"
+            "        )\n",
+            1,
+        )
+        c_setup['source'] = to_lines(setup_src)
+        c_setup['outputs'], c_setup['execution_count'] = [], None
+
+    # Corpus cell must not fail on a missing CONTEXT.
+    c_corp = by_id('5dda70a4')
+    corp_src = ''.join(c_corp['source'])
+    if "globals().get('CONTEXT'" not in corp_src:
+        corp_src = corp_src.replace(
+            "prefix_bytes, ending_bytes = min(192, CONTEXT//2), min(128, CONTEXT//2)",
+            "# Fall back to the configured default if this cell is run before \"Run settings\".\n"
+            "CONTEXT = globals().get('CONTEXT', 512)\n"
+            "\n"
+            "prefix_bytes, ending_bytes = min(192, CONTEXT//2), min(128, CONTEXT//2)",
+            1,
+        )
+        c_corp['source'] = to_lines(corp_src)
+        c_corp['outputs'], c_corp['execution_count'] = [], None
+
+    # Phase 0 hypothesis test lives in the last cell.
+    c_p0 = by_id('e7425b56')
+    c_p0['source'] = to_lines(PHASE0_CODE)
+    c_p0['outputs'], c_p0['execution_count'] = [], None
+
     c_dd = by_id('dialog-data')
     c_dd['source'] = to_lines(dialogue_src)
     c_dd['outputs'], c_dd['execution_count'] = [], None
@@ -685,9 +804,13 @@ def sync(root: Path | None = None):
     c_demo['source'] = to_lines(CHECKPOINT_DEMO_CODE)
     c_demo['outputs'], c_demo['execution_count'] = [], None
 
-    cells[:] = [c for c in cells if c.get('id') not in ('fact-switch-lib', 'fact-switch-train')]
+    cells[:] = [c for c in cells if c.get('id') not in ('fact-switch-lib', 'fact-switch-train', '50b46b5a')]
     dd_idx = next(i for i, c in enumerate(cells) if c.get('id') == 'dialog-data')
     cells[dd_idx + 1:dd_idx + 1] = [c_fs_lib, c_fs_train]
+
+    # The cleanup cell must be the very first thing that runs.
+    if not cells or cells[0].get('id') != '50b46b5a':
+        cells.insert(0, c_cleanup)
 
     nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + '\n', encoding='utf8')
     print(f'Synced {nb_path} ({len(cells)} cells).')
