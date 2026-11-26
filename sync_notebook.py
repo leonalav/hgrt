@@ -137,6 +137,7 @@ SENTENCE_LOSS_WEIGHT = 0.4    # weight of the sentence term
 PARAGRAPH_LOSS_WEIGHT = 0.6   # weight of the paragraph term
 SELECTION_SENTENCE_WEIGHT = 0.30   # weight of sentence accuracy in selection
 SENTENCE_EVAL_GROUPS = 256    # groups used to measure sentence accuracy
+WARMUP_STEPS = 1000           # LR ramp length when training from INITIAL_WEIGHTS
 
 # --- Phase 2: long-form prose data and target budgets ------------------------
 # Diagnosis 4: every supervised target was capped at 160 bytes, so the model
