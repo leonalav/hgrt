@@ -56,6 +56,7 @@ owt_anchors = None
 owt_sentence_anchors = None
 if OWT_DOCUMENTS > 0:
     try:
+        import pyarrow.parquet as pq
         owt_path = cache/'openwebtext.bin'
         owt_digest = hashlib.sha256()
         owt_offset = 0
@@ -63,39 +64,46 @@ if OWT_DOCUMENTS > 0:
         owt_sentence_offsets = array('q')
         owt_rows = 0
         with owt_path.open('wb') as dst:
-            shard = hf_hub_download(OWT_REPO, f'{OWT_SUBSET}/openwebtext.tar.xz',
-                                    repo_type='dataset')
-            import tarfile
-            with tarfile.open(shard) as archive:
-                for member in archive:
-                    if not member.isfile():
-                        continue
-                    if owt_rows >= OWT_DOCUMENTS:
-                        break
-                    handle = archive.extractfile(member)
-                    if handle is None:
-                        continue
-                    text = handle.read().decode('utf8', errors='replace')
-                    for paragraph in text.split('\\n\\n'):
-                        paragraph = paragraph.strip()
-                        if not paragraph:
+            # OpenWebText is stored as 80 parquet shards; load the first few
+            for shard_idx in range(80):
+                if owt_rows >= OWT_DOCUMENTS:
+                    break
+                shard_name = f'plain_text/train-{shard_idx:05d}-of-00080.parquet'
+                try:
+                    shard_path = hf_hub_download(OWT_REPO, shard_name, repo_type='dataset')
+                    table = pq.read_table(shard_path)
+                    for row in table.to_pylist():
+                        if owt_rows >= OWT_DOCUMENTS:
+                            break
+                        text = row.get('text', '')
+                        if not isinstance(text, str):
                             continue
-                        row = (paragraph + '\\n').encode('utf8')
-                        for cut in sentence_cuts(row.rstrip(b'\\n')):
-                            if SENTENCE_LEFT_BYTES <= cut <= len(row) - SENTENCE_RIGHT_BYTES - 1:
-                                owt_sentence_offsets.append(owt_offset + cut)
-                        owt_paras.append(owt_offset)
-                        dst.write(row)
-                        owt_digest.update(row)
-                        owt_offset += len(row)
-                        owt_rows += 1
-        owt_corpus = np.memmap(owt_path, dtype=np.uint8, mode='c')
-        owt_anchors = np.asarray(owt_paras, dtype=np.int64)
-        owt_sentence_anchors = np.asarray(owt_sentence_offsets, dtype=np.int64)
-        split_info['openwebtext'] = dict(bytes=owt_path.stat().st_size, rows=owt_rows,
-                                         sha256=owt_digest.hexdigest(), source=OWT_REPO)
-        print('openwebtext', owt_rows, 'documents,', len(owt_corpus), 'bytes,',
-              len(owt_sentence_anchors), 'sentence anchors')
+                        for paragraph in text.split('\\n\\n'):
+                            if owt_rows >= OWT_DOCUMENTS:
+                                break
+                            paragraph = paragraph.strip()
+                            if not paragraph:
+                                continue
+                            row_bytes = (paragraph + '\\n').encode('utf8')
+                            for cut in sentence_cuts(row_bytes.rstrip(b'\\n')):
+                                if SENTENCE_LEFT_BYTES <= cut <= len(row_bytes) - SENTENCE_RIGHT_BYTES - 1:
+                                    owt_sentence_offsets.append(owt_offset + cut)
+                            owt_paras.append(owt_offset)
+                            dst.write(row_bytes)
+                            owt_digest.update(row_bytes)
+                            owt_offset += len(row_bytes)
+                            owt_rows += 1
+                except Exception as shard_exc:
+                    print(f'  Skipped shard {shard_idx}: {shard_exc}')
+                    continue
+        if owt_rows > 0:
+            owt_corpus = np.memmap(owt_path, dtype=np.uint8, mode='c')
+            owt_anchors = np.asarray(owt_paras, dtype=np.int64)
+            owt_sentence_anchors = np.asarray(owt_sentence_offsets, dtype=np.int64)
+            split_info['openwebtext'] = dict(bytes=owt_path.stat().st_size, rows=owt_rows,
+                                             sha256=owt_digest.hexdigest(), source=OWT_REPO)
+            print('openwebtext', owt_rows, 'documents,', len(owt_corpus), 'bytes,',
+                  len(owt_sentence_anchors), 'sentence anchors')
     except Exception as exc:
         print('OpenWebText unavailable, continuing with WikiText only:', exc)
         owt_corpus = None
