@@ -67,25 +67,32 @@ def chat_prompt(user, history, passage, budget, qa_style='role'):
     return lead + tail
 
 
-def story_continuations(story, context):
+def story_continuations(story, context, target_bytes=224, max_sentences=2):
+    """Short prose continuations: one or two sentences after a short prompt.
+
+    `target_bytes` defaults to the historical 224-byte cap, which produced the
+    short padded targets described in Diagnosis 4. Callers that want sustained
+    prose pass a larger budget and more sentences.
+    """
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"“])', story)
     for i in range(1, len(sentences)):
         prompt = ' '.join(sentences[max(0, i-2):i]) + ' '
-        target = ' '.join(sentences[i:i+2])
-        if len(target.encode()) > 224:
+        target = ' '.join(sentences[i:i+max_sentences])
+        if len(target.encode()) > target_bytes:
             target = sentences[i]
-        if len(target.encode()) <= 224 and len((prompt + target).encode()) <= context:
+        if len(target.encode()) <= target_bytes and len((prompt + target).encode()) <= context:
             yield prompt, target
 
 
-def long_story_continuations(story, context, min_prefix_bytes=220, target_bytes=280):
+def long_story_continuations(story, context, min_prefix_bytes=220, target_bytes=280,
+                              max_sentences=3):
     """Multi-sentence prefixes (up to context - target_bytes) for practicing sustained prose."""
     sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"“])', story)
     prefix_budget = context - target_bytes
     for i in range(3, len(sentences)):
-        target = ' '.join(sentences[i:i+3])
+        target = ' '.join(sentences[i:i+max_sentences])
         if len(target.encode()) > target_bytes:
-            target = ' '.join(sentences[i:i+2])
+            target = ' '.join(sentences[i:i+max_sentences-1])
         if len(target.encode()) > target_bytes:
             target = sentences[i]
         if not target or len(target.encode()) > target_bytes:
@@ -130,7 +137,23 @@ def is_extractive_qa(prompt, target, max_answer_bytes=48):
     return ans in passage
 
 
-def prepare_dialogues(data, context, reply_bytes=160, qa_style='role'):
+def prepare_dialogues(data, context, reply_bytes=160, qa_style='role',
+                      prose_bytes=None, chat_bytes=None):
+    """Build the dialogue training pools.
+
+    The per-task target budgets are deliberately different:
+
+      * QA answers are extractive, so they stay short.
+      * Chat replies are short by nature, so they stay short.
+      * PROSE targets get a much larger budget. Every target used to be capped
+        at 160 bytes (~27 words), which trained the model to emit short clipped
+        spans and pad with high-frequency function words. Diagnosis 4 in
+        DIAGNOSIS_AND_PLAN.md.
+    """
+    if prose_bytes is None:
+        prose_bytes = max(reply_bytes, 512)
+    if chat_bytes is None:
+        chat_bytes = max(reply_bytes, 200)
     splits = {split: {task: [] for task in ('prose', 'qa', 'chat')}
               for split in ('train', 'validation', 'heldout')}
     prompt_budget = context - reply_bytes
@@ -141,10 +164,11 @@ def prepare_dialogues(data, context, reply_bytes=160, qa_style='role'):
     def group(text):
         return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], 'big') % 100
 
-    def add_reply(rows, user, reply, history, passage, style='role'):
+    def add_reply(rows, user, reply, history, passage, style='role', budget=None):
+        limit = reply_bytes if budget is None else budget
         prompt = chat_prompt(user, history, passage, prompt_budget, qa_style=style)
         target = reply + '\n'
-        if prompt is not None and reply and len(target.encode()) <= reply_bytes:
+        if prompt is not None and reply and len(target.encode()) <= limit:
             rows.append((prompt, target))
             return prompt, target
         return None
@@ -160,9 +184,12 @@ def prepare_dialogues(data, context, reply_bytes=160, qa_style='role'):
             split = 'heldout' if name.startswith('coqa-dev') else (
                 'validation' if group(story) < 5 else 'train')
             pools = splits[split]
-            pools['prose'].extend(story_continuations(story, context))
+            # Prose targets use the larger budget so the model learns to compose
+            # across sentence boundaries instead of emitting a short clipped span.
+            pools['prose'].extend(story_continuations(story, context, target_bytes=prose_bytes))
             if split == 'train':
-                pools['prose_long'].extend(long_story_continuations(story, context))
+                pools['prose_long'].extend(long_story_continuations(
+                    story, context, target_bytes=max(280, prose_bytes)))
             history = []
             for q, a in zip(item['questions'], item['answers'], strict=True):
                 if q['turn_id'] != a['turn_id']:
@@ -192,7 +219,8 @@ def prepare_dialogues(data, context, reply_bytes=160, qa_style='role'):
         history = []
         for (speaker, question), (next_speaker, answer) in zip(turns, turns[1:]):
             if (speaker, next_speaker) == ('USER', 'ASSISTANT'):
-                add_reply(splits[split]['chat'], question, answer, history, '', style='role')
+                add_reply(splits[split]['chat'], question, answer, history, '', style='role',
+                          budget=chat_bytes)
                 history.append((question, answer))
     return splits
 

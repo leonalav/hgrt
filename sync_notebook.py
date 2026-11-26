@@ -1,11 +1,15 @@
 """Sync embedded module cells (model.py, dialogue.py, fact_switch.py) and upgraded pipeline cells into run.ipynb."""
 import json
+import time
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from phase0_cell import PHASE0_CODE
 from resume_block import RESUME_BLOCK
+from phase3_probe_cell import PHASE3_PROBE_CODE
+import phase1_notebook
+import phase2_notebook
 
 
 def to_lines(text: str) -> list[str]:
@@ -120,6 +124,34 @@ assert DIALOGUE_CONTEXT >= 512 and DIALOGUE_CONTEXT % 64 == 0
 assert QA_PROMPT_STYLE in ('qa', 'role')
 assert MAX_UPDATES is None or MAX_UPDATES >= 1
 assert not (INITIAL_WEIGHTS and RESUME_FROM)
+
+# --- Phase 1: sentence-boundary-aware prose objective -------------------------
+# The paragraph-level objective (`continuation_nll`) has no notion of where a
+# sentence ends, so a model can minimise it by padding a 128-byte span with
+# locally frequent function words. These settings drive the sentence-level
+# discrimination term that supervises sentence completion directly.
+SENTENCE_CANDIDATES = 8      # 1 true continuation + 7 foils per group
+SENTENCE_LEFT_BYTES = 192     # context bytes before the sentence boundary
+SENTENCE_RIGHT_BYTES = 96     # bytes of the candidate sentence
+SENTENCE_LOSS_WEIGHT = 0.4    # weight of the sentence term
+PARAGRAPH_LOSS_WEIGHT = 0.6   # weight of the paragraph term
+SELECTION_SENTENCE_WEIGHT = 0.30   # weight of sentence accuracy in selection
+SENTENCE_EVAL_GROUPS = 256    # groups used to measure sentence accuracy
+
+# --- Phase 2: long-form prose data and target budgets ------------------------
+# Diagnosis 4: every supervised target was capped at 160 bytes, so the model
+# learned short clipped spans padded with high-frequency function words.
+# PROSE targets now get a much larger budget; QA and chat stay short because
+# extractive answers and chat replies are short by nature.
+PROSE_TARGET_BYTES = 512        # budget for prose targets
+CHAT_TARGET_BYTES = 200         # budget for chat replies
+QA_TARGET_BYTES = 160           # budget for extractive QA answers
+
+# OpenWebText supplies real, uncurated prose with far more syntactic variety
+# than WikiText, which is largely encyclopaedic. Set OWT_DOCUMENTS = 0 to skip.
+OWT_DOCUMENTS = 20000
+OWT_REPO = 'Skylion007/openwebtext'
+OWT_SUBSET = 'plain_text'
 """
 
 COLAB_CLEANUP_CODE = '''
@@ -801,6 +833,13 @@ def sync(root: Path | None = None):
     elif 'def survey_checkpoints' not in ''.join(c_lm['source']):
         raise RuntimeError('Could not locate the resume-selection block in cell d1eb119d.')
 
+    # Phase 3: the long-range context probe. It re-derives, for whatever
+    # checkpoint was selected, the evidence that made a CONTEXT=1024 retrain
+    # unnecessary (see PHASE3_DECISION.md).
+    if not any(c.get('id') == 'context-probe' for c in cells):
+        cells.insert(next(i for i, c in enumerate(cells) if c.get('id') == '2b82a875') + 1,
+                     make_cell('code', 'context-probe', PHASE3_PROBE_CODE))
+
     c_dd = by_id('dialog-data')
     c_dd['source'] = to_lines(dialogue_src)
     c_dd['outputs'], c_dd['execution_count'] = [], None
@@ -827,7 +866,29 @@ def sync(root: Path | None = None):
     if not cells or cells[0].get('id') != '50b46b5a':
         cells.insert(0, c_cleanup)
 
-    nb_path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + '\n', encoding='utf8')
+    # Phase 1: sentence-boundary-aware prose objective. Applied last so it sees
+    # the final state of every cell it touches.
+    objective_src = (root / 'phase1_objective.py').read_text(encoding='utf8').rstrip()
+    applied = phase1_notebook.apply_phase1(nb, objective_src)
+    if applied:
+        print(f'Applied Phase 1 objective changes: {applied}')
+
+    # Phase 2: long-form corpus and larger prose target budgets.
+    applied2 = phase2_notebook.apply_phase2(nb)
+    if applied2:
+        print(f'Applied Phase 2 data changes: {applied2}')
+
+    payload = json.dumps(nb, indent=1, ensure_ascii=False) + '\n'
+    # Windows can transiently lock the file (indexer, antivirus, an open
+    # editor tab). Retry briefly instead of failing the whole sync.
+    for attempt in range(6):
+        try:
+            nb_path.write_text(payload, encoding='utf8')
+            break
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.4)
     print(f'Synced {nb_path} ({len(cells)} cells).')
     for i, c in enumerate(cells):
         print(f"  [{i:02d}] {c['cell_type']:8s} id={c.get('id', '')}")
