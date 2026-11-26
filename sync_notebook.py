@@ -34,6 +34,30 @@ SETTINGS_CODE = """
 #@title Run settings
 from pathlib import Path
 
+# -- Version guard ------------------------------------------------------------
+# Colab autosaves the notebook to Drive and can restore a stale copy over your
+# edits. Detect that here so you always know which version is running.
+def _notebook_sha():
+    import hashlib, json as _json, os as _os
+    try:
+        nb = globals().get('__nb__')
+        if nb is not None:
+            body = _json.dumps(
+                [{'cell_type': c.cell_type, 'id': c.get('id'), 'source': c.source}
+                 for c in nb.cells], sort_keys=True).encode('utf8')
+            return hashlib.sha256(body).hexdigest()[:12]
+        path = _os.path.join(_os.getcwd(), 'run.ipynb')
+        if _os.path.exists(path):
+            return hashlib.sha256(open(path, 'rb').read()).hexdigest()[:12]
+    except Exception:
+        pass
+    return None
+
+_NOTEBOOK_SHA = _notebook_sha()
+print(f'Running notebook content id: {_NOTEBOOK_SHA or "(unknown)"}')
+print('If this differs from the version you pushed, re-open the notebook from GitHub')
+print('(File -> Open notebook -> GitHub -> leonalav/hgrt -> run.ipynb), NOT from Drive.')
+
 TRAIN_MINUTES = 20             # Additional WikiText prose training minutes per invocation (0 skips)
 CONTEXT = 512                  # UTF-8 bytes per prose sequence
 BATCH_BYTES = 8192             # Starting batch budget, in input bytes
