@@ -350,7 +350,9 @@ def revert_phase1(nb):
     # ---- corpus cell ------------------------------------------------------
     c = _cell_by_id(nb, '5dda70a4')
     text = ''.join(c['source'])
-    if 'sentence_anchors' in text:
+    # Match the same precise marker as apply_phase1. A bare 'sentence_anchors'
+    # substring also matches Phase 2's 'owt_sentence_anchors'.
+    if 'sentence_anchors = array(' in text:
         text = text.replace(CORPUS_DECLARE_NEW, CORPUS_DECLARE_OLD, 1)
         text = text.replace(CORPUS_SENTENCE_ANCHORS_NEW, CORPUS_SENTENCE_ANCHORS_OLD, 1)
         text = text.replace(CORPUS_RETURN_NEW, CORPUS_RETURN_OLD, 1)
@@ -420,7 +422,12 @@ def apply_phase1(nb, objective_source):
     # ---- 2. corpus cell: collect sentence anchors --------------------------
     c = _cell_by_id(nb, '5dda70a4')
     text = ''.join(c['source'])
-    if 'sentence_anchors' not in text:
+    # The guard must match a marker that only Phase 1 introduces. A bare
+    # 'sentence_anchors' substring is NOT safe: Phase 2 adds
+    # 'owt_sentence_anchors' to the same cell, which would make the guard
+    # always false and silently skip every corpus edit. Use the declaration
+    # line instead, which is unique to Phase 1.
+    if 'sentence_anchors = array(' not in text:
         text = _replace_once(text, CORPUS_DECLARE_OLD, CORPUS_DECLARE_NEW, 'corpus declare')
         text = _replace_once(text, CORPUS_SENTENCE_ANCHORS_OLD, CORPUS_SENTENCE_ANCHORS_NEW, 'corpus anchors')
         text = _replace_once(text, CORPUS_RETURN_OLD, CORPUS_RETURN_NEW, 'corpus return')

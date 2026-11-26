@@ -111,6 +111,38 @@ class ApplyTests(unittest.TestCase):
             self.assertNotIn(f'\n{name} =', obj,
                              f'{name} belongs in the settings cell, not the objective cell')
 
+    def test_corpus_edits_survive_phase2_openwebtext(self):
+        """Regression: Phase 2's 'owt_sentence_anchors' must not block Phase 1.
+
+        Phase 1 guards its corpus edits on a substring check. Phase 2 adds
+        'owt_sentence_anchors' to the same cell, so a bare 'sentence_anchors'
+        guard always matched and every corpus edit was silently skipped. The
+        result was a NameError at runtime: 'sentence_anchors' is not defined.
+        """
+        nb = load()
+        P.revert_phase1(nb)
+        P.apply_phase1(nb, objective_source())
+        text = cell_text(nb, '5dda70a4')
+
+        # The sentence-anchor accumulator must exist.
+        self.assertIn('sentence_anchors = array(', text)
+        # make_split must return the sentence anchors, and the caller must
+        # unpack all four values.
+        self.assertIn('np.asarray(sentence_anchors, dtype=np.int64))', text)
+        self.assertIn('sentence_anchors[split]) = make_split(split)', text)
+        # use_sentences must be defined before anything reads it.
+        self.assertIn('use_sentences = (', text)
+        # And the ordering must hold: anchors are populated before use.
+        self.assertLess(text.index('sentence_anchors[split]) = make_split(split)'),
+                        text.index('use_sentences = ('))
+
+    def test_apply_reports_corpus_change_even_with_phase2_present(self):
+        """The 'corpus' item must appear in the applied list."""
+        nb = load()
+        P.revert_phase1(nb)
+        applied = P.apply_phase1(nb, objective_source())
+        self.assertIn('corpus', applied)
+
 
 if __name__ == '__main__':
     unittest.main()
