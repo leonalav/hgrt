@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from phase0_cell import PHASE0_CODE
+from resume_block import RESUME_BLOCK
 
 
 def to_lines(text: str) -> list[str]:
@@ -785,6 +786,20 @@ def sync(root: Path | None = None):
     c_p0 = by_id('e7425b56')
     c_p0['source'] = to_lines(PHASE0_CODE)
     c_p0['outputs'], c_p0['execution_count'] = [], None
+
+    # Resume-selection block: survey every run directory and prefer the best
+    # prose weights, instead of only globbing wiki-*/latest.pt.
+    c_lm = by_id('d1eb119d')
+    lm_lines = ''.join(c_lm['source']).split('\n')
+    if any(l.startswith('def matching_checkpoint') for l in lm_lines):
+        start = next(i for i, l in enumerate(lm_lines) if l.startswith('def matching_checkpoint'))
+        end = next(i for i, l in enumerate(lm_lines) if l.strip() == 'del ck')
+        new_lines = RESUME_BLOCK.strip('\n').split('\n')
+        out_lines = lm_lines[:start] + new_lines + lm_lines[end + 1:]
+        c_lm['source'] = [l + '\n' for l in out_lines[:-1]] + [out_lines[-1]]
+        c_lm['outputs'], c_lm['execution_count'] = [], None
+    elif 'def survey_checkpoints' not in ''.join(c_lm['source']):
+        raise RuntimeError('Could not locate the resume-selection block in cell d1eb119d.')
 
     c_dd = by_id('dialog-data')
     c_dd['source'] = to_lines(dialogue_src)
