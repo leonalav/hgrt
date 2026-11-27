@@ -193,6 +193,35 @@ class NotebookPhase1Tests(unittest.TestCase):
         for a in anchors:
             self.assertTrue(paragraph[a:].startswith((b'The ', b'Third ', b'And ')))
 
+    def test_downstream_stage_learning_rates_are_prose_safe(self):
+        """The fact-switch and dialogue stages must not use a destructive rate.
+
+        Both stages start from the CONVERGED prose checkpoint with a FRESH
+        optimizer, so they are in exactly the situation the Phase-1 learning
+        rate policy exists for -- and they were not covered by it.
+
+        Measured on the run-2 checkpoint (40 steps of the contrastive
+        objective, held-out wikitext BPB):
+
+            LR=5e-4   1.4786 -> 2.9383  (+1.4598)   destroys the model
+            LR=1e-4   1.4786 -> 1.5240  (+0.0455)
+            LR=2e-5   1.4786 -> 1.4810  (+0.0024)   prose preserved
+
+        And the task is still learned at 2e-5: the contrastive loss fell
+        8.18 -> 7.11 (-1.07) over the same 40 steps.
+        """
+        text = cell_source('3adb75ac')
+        scope = {}
+        lines = [l for l in text.splitlines()
+                 if l.startswith(('FACT_SWITCH_LR', 'DIALOGUE_LR'))]
+        self.assertEqual(len(lines), 2, f'expected both stage rates, got {lines}')
+        exec('\n'.join(lines), scope)
+        self.assertLessEqual(scope['FACT_SWITCH_LR'], 2e-5)
+        self.assertLessEqual(scope['DIALOGUE_LR'], 2e-5)
+        # The scratch prose rate is 5e-4; a downstream stage must never use it.
+        self.assertLess(scope['FACT_SWITCH_LR'], 5e-4)
+        self.assertLess(scope['DIALOGUE_LR'], 5e-4)
+
 
 if __name__ == '__main__':
     unittest.main()

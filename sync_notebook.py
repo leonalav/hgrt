@@ -35,7 +35,7 @@ In Colab, open this notebook directly from GitHub, choose **Runtime → Change r
 
 **Research pipeline (in priority order):**
 1. **WikiText-103 prose pretraining / resume (`TRAIN_MINUTES`)** — pinned raw Parquet shards ([Dataset card](https://huggingface.co/datasets/Salesforce/wikitext) · [Merity et al.](https://arxiv.org/abs/1609.07843)), with matched vs. mismatched paragraph-continuation scoring.
-2. **Counterfactual fact-to-answer learning (`FACT_SWITCH_MINUTES`)** — two-stage training directly targeting fact-to-answer switching on strictly disjoint OOV entities and novel nonce words: Stage 1 (`plain_nll`) locks in multi-byte OOV copying; Stage 2 (`contrastive` on 2×2 value-swap + question-swap quads) cancels both static word priors and Sentence-1 positional shortcuts. Selects checkpoints by counterfactual pair accuracy and greedy exact match rather than average BPB, and logs causal Tree ablations (`on` / `off` / `shuffle` / `counterfactual_tree_swap`). Set `RUN_ARCHITECTURE_SHOWDOWN = True` on an A100 to run a matched 4-arm head-to-head (`C1 L7-only`, `C1 L3+L7`, native `C1 rw=64` Tree-only, and same-size 10M Transformer `A0`).
+2. **Counterfactual fact-to-answer learning (`FACT_SWITCH_MINUTES`)** — two-stage training directly targeting fact-to-answer switching on strictly disjoint OOV entities and novel nonce words: Stage 1 (`plain_nll`) locks in multi-byte OOV copying; Stage 2 (`contrastive` on 2×2 value-swap + question-swap quads) cancels both static word priors and Sentence-1 positional shortcuts. Checkpoints are selected on a **disjoint** selection suite and reported on a **fresh-seed** report suite, using the first-byte decision accuracy plus counterfactual pair accuracy and greedy exact match rather than average BPB, and the causal Tree ablations (`on` / `off` / `permute` / `counterfactual_tree_swap`) are reported alongside them. Set `RUN_ARCHITECTURE_SHOWDOWN = True` on an A100 to run a matched 4-arm head-to-head (`C1 L7-only`, `C1 L3+L7`, native `C1 rw=64` Tree-only, and same-size 10M Transformer `A0`).
 3. **Rebalanced grounded QA, sustained prose & service chat (`DIALOGUE_MINUTES`)** — separates grounded QA (`Passage:/Question:/Answer:`) from service chat (`User:/Assistant:`) to stop domain leakage, auto-tunes CUDA batch size even when `TRAIN_MINUTES = 0`, rebalances QA + counterfactual quads + multi-sentence `prose_long` continuations, and preserves counterfactual fact-switching during checkpoint selection.
 """
 
@@ -92,7 +92,20 @@ TASK_MINUTES = 0               # Optional additional practice when RUN_REASONING
 
 # Priority #1: Counterfactual fact-to-answer learning & optional A100 architecture showdown
 FACT_SWITCH_MINUTES = 6        # Two-stage 2x2 quad fact-switching stage (0 evaluates zero-shot only)
-FACT_SWITCH_LR = 0.0005
+# The fact-switch stage starts from the CONVERGED prose checkpoint with a FRESH
+# optimizer, so it must use a prose-safe rate. Measured on the run-2 checkpoint
+# (40 steps of the contrastive objective, wikitext validation BPB):
+#
+#     LR=5e-4   BPB 1.4786 -> 2.9383  (+1.4598)  <-- the old value: destroys the model
+#     LR=1e-4   BPB 1.4786 -> 1.5240  (+0.0455)
+#     LR=5e-5   BPB 1.4786 -> 1.4932  (+0.0146)
+#     LR=2e-5   BPB 1.4786 -> 1.4810  (+0.0024)  <-- prose preserved
+#     LR=5e-6   BPB 1.4786 -> 1.4781  (-0.0004)
+#
+# And the task is still LEARNED at 2e-5: the contrastive loss fell 8.18 -> 7.11
+# (-1.07) over the same 40 steps, with the wikitext BPB essentially unchanged.
+# At 5e-4 the loss also falls, but only because the model is being destroyed.
+FACT_SWITCH_LR = 0.00002
 FACT_SWITCH_EVAL_PAIRS = 16    # Held-out OOV pairs per diagnostic split
 RUN_ARCHITECTURE_SHOWDOWN = False  # Optional A100 showdown: C1(L7), C1(L3+L7), C1(rw=64 Tree), A0(10M)
 SHOWDOWN_STEPS = 1200          # Optimizer steps per showdown arm (batch=4 quads/step on CUDA, 1 on CPU)
@@ -100,7 +113,7 @@ SHOWDOWN_STEPS = 1200          # Optimizer steps per showdown arm (batch=4 quads
 # Priority #2: Rebalanced grounded QA, sustained prose and conversation
 DIALOGUE_MINUTES = 12          # Additional time for QA, sustained prose, chat and WikiText replay
 DIALOGUE_CONTEXT = 1536        # Complete passage + turn history + target, in UTF-8 bytes
-DIALOGUE_LR = .00015
+DIALOGUE_LR = .00002
 DIALOGUE_EVAL_ROWS = 32        # Fixed rows per task and split
 QA_PROMPT_STYLE = 'qa'         # 'qa' separates Passage/Question/Answer from User/Assistant chat; 'role' is legacy
 DIALOGUE_WIDEN_L3 = False      # Optional: widen Layer 3 as well as Layer 7 to DIALOGUE_CONTEXT (0 new params)
