@@ -213,14 +213,22 @@ DIALOG_INTRO_MD = """
 
 This section runs in two cleanly separated stages:
 
-1. **Counterfactual fact-to-answer learning (`FACT_SWITCH_MINUTES`)**: Uses strictly disjoint OOV evaluation vocabularies and 2×2 counterfactual quads (value-swap + question-swap) with anti-memorization nonce words. Stage 1 (`plain_nll`) builds the multi-byte copy circuit; Stage 2 (`contrastive`) drives key-matched disambiguation without letting Sentence-1 positional shortcuts pass. Checkpoints are selected by counterfactual pair accuracy and greedy exact match (never average BPB), with causal Tree ablations (`on`, `off`, `shuffle`, and `counterfactual_tree_swap`). Optionally set `RUN_ARCHITECTURE_SHOWDOWN = True` on an A100 to compare `C1(L7)`, `C1(L3+L7)`, native `C1(rw=64 Tree)`, and a 10M full Transformer (`A0`) under identical step and quad budgets.
+1. **Counterfactual fact-to-answer learning (`FACT_SWITCH_MINUTES`)**: Uses strictly disjoint OOV evaluation vocabularies and 2×2 counterfactual quads (value-swap + question-swap) with anti-memorization nonce words. Stage 1 (`plain_nll`) builds the multi-byte copy circuit; Stage 2 (`contrastive`) drives key-matched disambiguation without letting Sentence-1 positional shortcuts pass. Checkpoints are selected on a **disjoint** selection suite and reported on a **fresh-seed** report suite (never the same pairs), using the first-byte decision accuracy plus counterfactual pair accuracy and greedy exact match (never average BPB). Causal Tree ablations are reported as `on` / `off` / `permute` (a seeded, content-level permutation with a per-pair donor audit) alongside a real counterfactual activation patch with an unrelated-donor control. The `far_*` splits put the fact ≥ 2048 bytes before the question so that only the tree memory can carry it. Optionally set `RUN_ARCHITECTURE_SHOWDOWN = True` on an A100 to compare `C1(L7)`, `C1(L3+L7)`, native `C1(rw=64 Tree)`, and a 10M full Transformer (`A0`) under identical step and quad budgets.
 2. **Rebalanced grounded QA, sustained prose and service chat (`DIALOGUE_MINUTES`)**: Separates grounded QA (`Passage:/Question:/Answer:` when `QA_PROMPT_STYLE = 'qa'`) from Taskmaster service chat (`User:/Assistant:`) to eliminate cross-domain style leakage, auto-tunes CUDA batch size even when `TRAIN_MINUTES = 0`, rebalances grounded QA / extractive QA / counterfactual quads / multi-sentence `prose_long` continuations / WikiText anchors, and selects checkpoints using both validation BPB and live counterfactual fact-switching. [CoQA](https://stanfordnlp.github.io/coqa/) · [Taskmaster-1](https://github.com/google-research-datasets/Taskmaster/tree/master/TM-1-2019)
 """
 
 FACT_SWITCH_TRAIN_CODE = """
 #@title Priority #1: Counterfactual fact-to-answer stage and optional A100 showdown
-fact_suite = build_fact_switch_suite(qa_style=QA_PROMPT_STYLE, pairs_per_split=FACT_SWITCH_EVAL_PAIRS)
-fact_base_eval = evaluate_fact_switch_suite(prose_model, fact_suite, device, do_generate=True, run_tree_ablations=True)
+# The SELECTION suite and the REPORT suite are DISJOINT (fresh seed), so the reported
+# numbers are never the maximum over the selection evaluations.
+fact_select_suite = build_fact_switch_suite(
+    qa_style=QA_PROMPT_STYLE, pairs_per_split=FACT_SWITCH_EVAL_PAIRS, require_memory=True)
+fact_report_suite = build_fact_switch_suite(
+    qa_style=QA_PROMPT_STYLE, pairs_per_split=FACT_SWITCH_EVAL_PAIRS, seed_offset=100_000)
+fact_suite = fact_report_suite
+fact_base_eval = evaluate_fact_switch_suite(
+    prose_model, fact_report_suite, device, do_generate=True, run_tree_ablations=True,
+    permutation_audit=True)
 print(format_fact_switch_table('Zero-shot prose checkpoint', fact_base_eval), flush=True)
 
 fact_switch_result = dict(
@@ -228,6 +236,7 @@ fact_switch_result = dict(
     minutes_requested=FACT_SWITCH_MINUTES,
     widen_l3=DIALOGUE_WIDEN_L3,
     zero_shot=fact_base_eval,
+    selection_is_disjoint=suites_are_disjoint(fact_select_suite, fact_report_suite),
     checkpoint=None,
 )
 fact_model = prose_model
@@ -271,7 +280,7 @@ if FACT_SWITCH_MINUTES > 0:
     fs_wiki_rng = np.random.default_rng(SEED + 409)
     wiki_replay_n = max(2, min(batch_size if TRAIN_MINUTES else 8, BATCH_BYTES // CONTEXT))
     fs_net, fs_run = run_two_stage_fact_switch(
-        fs_net, fact_suite, device,
+        fs_net, fact_select_suite, device,
         minutes=FACT_SWITCH_MINUTES,
         max_steps=MAX_UPDATES,
         quads_per_step=fs_quads,
@@ -282,6 +291,8 @@ if FACT_SWITCH_MINUTES > 0:
         replay_every=6,
         eval_interval_seconds=60.0,
         event_fn=event,
+        select_suite=fact_select_suite,
+        report_suite=fact_report_suite,
     )
     fs_path = run_dir/'best_fact_switch.pt'
     tmp = fs_path.with_suffix('.partial')
@@ -322,10 +333,11 @@ if RUN_ARCHITECTURE_SHOWDOWN:
         if spec['from_base']:
             net.load_state_dict(base_sd)
         net, run_out = run_two_stage_fact_switch(
-            net, fact_suite, device,
+            net, fact_select_suite, device,
             minutes=0.0, max_steps=SHOWDOWN_STEPS, quads_per_step=sd_quads,
             lr=spec['lr'], qa_style=QA_PROMPT_STYLE, seed=SEED,
             eval_interval_seconds=90.0, event_fn=event,
+            select_suite=fact_select_suite, report_suite=fact_report_suite,
         )
         print(format_fact_switch_table(f'Showdown {arm_name}', run_out['selected']), flush=True)
         showdown_result['arms'][arm_name] = run_out
@@ -362,9 +374,10 @@ def score_dialogues(net, examples):
 
 def dialogue_selection_score(bpb_metrics, cf_summary):
     mean_bpb = sum(bpb_metrics.values()) / len(bpb_metrics)
-    qswap_acc = cf_summary['oov_qswap']['pair_acc']
-    clean_acc = cf_summary['oov_clean']['pair_acc']
+    qswap_acc = cf_summary['oov_qswap'].get('first_byte_acc', cf_summary['oov_qswap']['pair_acc'])
+    clean_acc = cf_summary['oov_clean'].get('first_byte_acc', cf_summary['oov_clean']['pair_acc'])
     # Lower is better: preserve counterfactual fact-switching alongside held-out BPB.
+    # `first_byte_acc` is the PRIMARY decision metric; `pair_acc` is the fallback.
     return mean_bpb - 0.35 * qswap_acc - 0.15 * clean_acc
 
 def tune_dialogue_batch(net, sample_rows):
@@ -837,9 +850,16 @@ def sync(root: Path | None = None):
     # Phase 3: the long-range context probe. It re-derives, for whatever
     # checkpoint was selected, the evidence that made a CONTEXT=1024 retrain
     # unnecessary (see PHASE3_DECISION.md).
-    if not any(c.get('id') == 'context-probe' for c in cells):
+    # The cell is ALWAYS refreshed (not only inserted when missing), so a fix
+    # to `phase3_probe_cell.py` -- e.g. holding the probe content fixed across
+    # context lengths (W9) -- reaches the notebook.
+    c_probe = next((c for c in cells if c.get('id') == 'context-probe'), None)
+    if c_probe is None:
         cells.insert(next(i for i, c in enumerate(cells) if c.get('id') == '2b82a875') + 1,
                      make_cell('code', 'context-probe', PHASE3_PROBE_CODE))
+    else:
+        c_probe['source'] = to_lines(PHASE3_PROBE_CODE)
+        c_probe['outputs'], c_probe['execution_count'] = [], None
 
     c_dd = by_id('dialog-data')
     c_dd['source'] = to_lines(dialogue_src)

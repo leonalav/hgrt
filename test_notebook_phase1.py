@@ -81,7 +81,10 @@ class NotebookPhase1Tests(unittest.TestCase):
     def test_train_loop_uses_the_sentence_step_and_fixed_warmup(self):
         text = cell_source('69ac46a1')
         self.assertIn('sentence_step', text)
-        self.assertIn('WARMUP_STEPS', text)
+        # The ramp length and the base learning rate are POLICY, derived from
+        # where the weights came from -- not hard-coded constants.
+        self.assertIn('warmup_steps(resume_path, INITIAL_WEIGHTS)', text)
+        self.assertIn('learning_rate(resume_path, INITIAL_WEIGHTS)', text)
         self.assertNotIn('warmup_step/50', text)
 
     def test_selection_uses_the_combined_score(self):
@@ -145,10 +148,29 @@ class NotebookPhase1Tests(unittest.TestCase):
         self.assertEqual(scope['warmup_steps']('latest.pt', None), 1)
 
     def test_the_notebook_uses_the_same_warmup_values(self):
-        """WARMUP_STEPS must exist and be set from the same rule."""
+        """The ramp length and base LR must come from the shared policy."""
         text = cell_source('69ac46a1')
-        self.assertIn('WARMUP_STEPS', text)
-        self.assertIn('LR*min(1., warmup_step/WARMUP_STEPS)', text)
+        self.assertIn('warmup_steps(resume_path, INITIAL_WEIGHTS)', text)
+        self.assertIn('learning_rate(resume_path, INITIAL_WEIGHTS)', text)
+        self.assertIn('base_lr*min(1., warmup_step/ramp)', text)
+
+    def test_learning_rate_policy_is_smaller_for_seeded_and_resumed_models(self):
+        """A converged model must not be trained at the scratch learning rate.
+
+        Measured: at LR=5e-4 the run-2 checkpoint's validation BPB rose from
+        1.4717 to 1.7310 in 40 steps; at 2e-5 it fell to 1.4153.
+        """
+        scope = {'torch': torch, 'np': np, 'device': 'cpu'}
+        load_functions('sentence-objective', {'learning_rate'}, scope)
+        fresh = scope['learning_rate'](None, None)
+        seeded = scope['learning_rate'](None, 'best_lm.pt')
+        resumed = scope['learning_rate']('latest.pt', None)
+        self.assertEqual(fresh, 5e-4)
+        self.assertLess(seeded, fresh)
+        self.assertLess(resumed, fresh)
+        # The reduced rate must be the measured optimum (~2e-5).
+        self.assertAlmostEqual(seeded, 2e-5, places=6)
+        self.assertAlmostEqual(resumed, 2e-5, places=6)
 
     def test_sentence_anchor_collection_from_a_real_paragraph(self):
         scope = {'torch': torch, 'np': np, 'device': 'cpu', 're': re}

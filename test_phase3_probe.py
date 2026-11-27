@@ -89,6 +89,60 @@ class ContextSensitivityTests(unittest.TestCase):
         for value in result.values():
             self.assertGreater(value, 0.0)
 
+    def test_bpb_by_context_unpaired_mode_still_works(self):
+        from model import LM
+        model = LM('C1', 8)
+        model.eval()
+        data = np.frombuffer(b'The committee approved the plan . ' * 400, dtype=np.uint8)
+        result = bpb_by_context(model, data, lengths=(64, 128), windows=3, offset=100,
+                                paired=False)
+        self.assertEqual(set(result), {64, 128})
+
+    def test_bpb_by_context_holds_content_fixed(self):
+        """W9: every length must be scored on the SAME byte ranges.
+
+        The naive probe walked a different range per length, so a BPB change
+        between two lengths conflated "more context" with "different text".
+        With `paired=True` the shorter windows are prefixes of the longer ones,
+        so the curve isolates the context length.
+        """
+        from model import LM
+        model = LM('C1', 8)
+        model.eval()
+        data = np.frombuffer(b'The committee approved the plan . ' * 400, dtype=np.uint8)
+        lengths = (64, 128, 256)
+        windows = 3
+        offset = 100
+        paired = bpb_by_context(model, data, lengths=lengths, windows=windows,
+                                offset=offset, paired=True)
+        self.assertEqual(set(paired), set(lengths))
+
+        # Recompute the paired numbers by hand: the windows for length L are
+        # the prefixes of the windows for the longest length.
+        longest = max(lengths)
+        starts = offset + np.arange(windows) * longest
+        for length in lengths:
+            blocks = np.stack([data[s:s + length + 1] for s in starts])
+            x = torch.from_numpy(blocks[:, :-1]).long()
+            y = torch.from_numpy(blocks[:, 1:]).long()
+            with torch.inference_mode():
+                logits = model(x)
+                nll = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, 256).float(), y.reshape(-1), reduction='sum')
+            expected = float(nll) / (windows * length * np.log(2))
+            self.assertAlmostEqual(paired[length], expected, places=9)
+
+        # The unpaired walk uses DIFFERENT byte ranges -- that is exactly the
+        # confound the paired mode removes.
+        unpaired = bpb_by_context(model, data, lengths=lengths, windows=windows,
+                                  offset=offset, paired=False)
+        self.assertEqual(set(unpaired), set(lengths))
+        self.assertNotEqual(
+            [round(unpaired[l], 9) for l in lengths],
+            [round(paired[l], 9) for l in lengths],
+            'the paired and unpaired probes scored identical windows',
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

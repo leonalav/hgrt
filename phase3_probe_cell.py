@@ -23,9 +23,18 @@ def probe_context(model, split='validation'):
     data = _np.frombuffer(bytes(raw[:probe_bytes]), dtype=_np.uint8)
     lengths = [L for L in (64, 128, 256, 512, 1024, 2048) if probe_bytes > L * 64]
     curve = {}
+    # W9: HOLD THE CONTENT FIXED.  Every context length must be scored on the
+    # SAME byte ranges, otherwise a change in BPB between two lengths
+    # conflates "more context" with "different text" -- and the text dominates
+    # (adjacent passages differ a lot in intrinsic difficulty).  The windows
+    # for length L are prefixes of the windows for the longest length, so the
+    # curve isolates the effect of the context length itself.
+    longest = max(lengths) if lengths else 0
     for L in lengths:
-        windows = max(4, min(40, (probe_bytes - 1) // L))
-        starts = _np.arange(0, windows * L, L)
+        windows = max(4, min(40, (probe_bytes - 1) // longest)) if longest else 0
+        if not windows:
+            continue
+        starts = _np.arange(0, windows * longest, longest)
         blocks = _np.stack([data[s:s+L+1] for s in starts])
         x = torch.from_numpy(blocks[:, :-1].copy()).long().to(device)
         y = torch.from_numpy(blocks[:, 1:].copy()).long().to(device)

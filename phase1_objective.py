@@ -222,3 +222,31 @@ def warmup_steps(resume_path, initial_weights, fresh=50, seeded=5):
     if initial_weights:
         return seeded
     return fresh
+
+
+def learning_rate(resume_path, initial_weights, base_lr=5e-4,
+                   seeded_scale=0.04, resume_scale=0.04):
+    """The learning rate appropriate to where the weights came from.
+
+    A model trained from scratch can take the full base learning rate. A model
+    whose weights are SEEDED from a checkpoint, or that is RESUMED with a
+    restored optimizer state, is already converged and must not be pushed at
+    the scratch learning rate: at LR=5e-4 the run-2 checkpoint's validation BPB
+    rose from 1.4717 to 1.7310 in 40 steps, while the same steps at a reduced
+    rate improved it to 1.4153.
+
+    The objective was ruled out as the cause: pure next-byte cross-entropy at
+    LR=5e-4 degraded the model by +0.28 BPB, essentially the same as the
+    notebook's mixed schedule (+0.26 BPB). It is the rate, not the loss.
+
+    `seeded_scale` and `resume_scale` are 0.04, i.e. 2e-5, which sits at the
+    measured optimum of the LR sweep (2e-5 was best: -0.0564 BPB; 5e-5 gave
+    -0.0489; 1e-4 gave -0.0154; 5e-4 gave +0.2593).
+
+    Returns the base learning rate to use.
+    """
+    if resume_path:
+        return base_lr * resume_scale
+    if initial_weights:
+        return base_lr * seeded_scale
+    return base_lr

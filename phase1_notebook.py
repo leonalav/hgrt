@@ -207,6 +207,123 @@ WARMUP_NEW = """    # The warm-up ramp exists to stabilise a FRESH model. Re-run
         group['lr'] = LR*min(1., warmup_step/WARMUP_STEPS)
 """
 
+# --- Phase 3: the learning-rate policy must depend on where the weights came
+# from.
+#
+# MEASURED ROOT CAUSE (see REMEDIATION_PLAN.md section 3 and the experiment
+# scripts in the repo history). Controlled 40-60 step runs starting from the
+# exact run-2 checkpoint (best_lm.pt, val BPB 1.417), measuring validation BPB
+# on 32-64 held-out wikitext windows:
+#
+#   LR=5e-4  mixed schedule  bpb 1.4717 -> 1.7310  (+0.2593)   <-- the run's LR
+#   LR=5e-4  PURE next-byte CE bpb 1.4717 -> 1.7538 (+0.2821)
+#   LR=1e-4  mixed           bpb 1.4717 -> 1.4563  (-0.0154)
+#   LR=5e-5  mixed           bpb 1.4717 -> 1.4228  (-0.0489)
+#   LR=2e-5  mixed           bpb 1.4717 -> 1.4153  (-0.0564)
+#
+# The objective is NOT the cause: pure next-byte CE degrades the model by the
+# same amount (+0.28 vs +0.26) at the same LR. The cause is that LR=5e-4 is
+# 5-25x too large for a model that is already converged.
+#
+# The run-2 trajectory confirms this: BPB rises from 1.417 to 1.590 exactly
+# while the warm-up ramp was climbing LR from 5e-7 to 5e-4 (steps 5908-7246),
+# then plateaus at the damaged ~1.61 once LR saturates.
+#
+# So the fix is an LR POLICY: a model seeded from existing weights or resumed
+# with a restored optimizer state must train at a reduced LR, and the ramp
+# length must come from `warmup_steps()` rather than a hard-coded constant.
+WARMUP_RAMP_OLD = """    warmup_step = step+1 if resume_path else step-initial_step+1
+    for group in optimizer.param_groups:
+        group['lr'] = LR*min(1., warmup_step/WARMUP_STEPS)
+"""
+
+WARMUP_RAMP_NEW = """    # The learning rate and the ramp length are POLICY, not constants.
+    #
+    # `warmup_steps()` returns 1 for a resume (the optimizer state is restored,
+    # so the model is already in its basin), a short ramp for weights seeded
+    # from a checkpoint (fresh optimizer, but converged weights), and the full
+    # ramp only for a model trained from scratch.
+    #
+    # `learning_rate()` returns the LR appropriate to that situation. The
+    # previous code always used the full LR (5e-4) with a 1000-step ramp, so a
+    # seeded run spent its first 1000 steps ramping into a learning rate that
+    # is 5-25x too large for an already-converged model. Measured effect on
+    # the run-2 checkpoint: 40 steps at LR=5e-4 moved validation BPB from
+    # 1.4717 to 1.7310, while the same steps at LR=2e-5 moved it to 1.4153.
+    # The objective was exonerated: pure next-byte CE at LR=5e-4 degraded the
+    # model just as much (+0.28 vs +0.26).
+    ramp = max(1, int(warmup_steps(resume_path, INITIAL_WEIGHTS)))
+    base_lr = learning_rate(resume_path, INITIAL_WEIGHTS)
+    warmup_step = step+1 if resume_path else step-initial_step+1
+    for group in optimizer.param_groups:
+        group['lr'] = base_lr*min(1., warmup_step/ramp)
+"""
+
+# An intermediate version of the patch: the ramp length came from
+# `warmup_steps()` but the base learning rate was still the raw constant.
+# Kept so the patcher can upgrade an already-patched notebook in place.
+WARMUP_RAMP_OLD_ONLY = """    # The ramp length is policy, not a constant. `warmup_steps()` returns 1 for
+    # a resume (the optimizer state is restored, so the model is already in
+    # its basin), a short ramp for weights seeded from a checkpoint (fresh
+    # optimizer, but converged weights), and the full ramp only for a model
+    # trained from scratch.
+    #
+    # The previous code divided by the constant WARMUP_STEPS=1000 in every
+    # case, so a seeded run spent its first 1000 steps at a fraction of the
+    # learning rate. In run wiki-20261126-094906-x43tfl7_ (seeded from
+    # INITIAL_WEIGHTS) validation BPB rose monotonically 1.417 -> 1.62 and
+    # never recovered.
+    ramp = max(1, int(warmup_steps(resume_path, INITIAL_WEIGHTS)))
+    warmup_step = step+1 if resume_path else step-initial_step+1
+    for group in optimizer.param_groups:
+        group['lr'] = LR*min(1., warmup_step/ramp)
+"""
+
+# The `learning_rate` policy function, appended to the objective cell. It is
+# kept here (rather than only in phase1_objective.py) so the notebook can be
+# repaired in place even when the objective cell was embedded by an earlier
+# run and `apply_phase1` therefore does not re-embed it.
+WARMUP_STEPS_MODULE_OLD = """    if resume_path:
+        return 1
+    if initial_weights:
+        return seeded
+    return fresh"""
+
+WARMUP_STEPS_MODULE_NEW = """    if resume_path:
+        return 1
+    if initial_weights:
+        return seeded
+    return fresh
+
+
+def learning_rate(resume_path, initial_weights, base_lr=5e-4,
+                   seeded_scale=0.04, resume_scale=0.04):
+    \"\"\"The learning rate appropriate to where the weights came from.
+
+    A model trained from scratch can take the full base learning rate. A model
+    whose weights are SEEDED from a checkpoint, or that is RESUMED with a
+    restored optimizer state, is already converged and must not be pushed at
+    the scratch learning rate: at LR=5e-4 the run-2 checkpoint's validation BPB
+    rose from 1.4717 to 1.7310 in 40 steps, while the same steps at a reduced
+    rate improved it to 1.4153.
+
+    The objective was ruled out as the cause: pure next-byte cross-entropy at
+    LR=5e-4 degraded the model by +0.28 BPB, essentially the same as the
+    notebook's mixed schedule (+0.26 BPB). It is the rate, not the loss.
+
+    `seeded_scale` and `resume_scale` are 0.04, i.e. 2e-5, which sits at the
+    measured optimum of the LR sweep (2e-5 was best: -0.0564 BPB; 5e-5 gave
+    -0.0489; 1e-4 gave -0.0154; 5e-4 gave +0.2593).
+
+    Returns the base learning rate to use.
+    \"\"\"
+    if resume_path:
+        return base_lr * resume_scale
+    if initial_weights:
+        return base_lr * seeded_scale
+    return base_lr
+"""
+
 EVALUATE_SENTENCES = '''
 
 @torch.inference_mode()
@@ -384,6 +501,9 @@ def revert_phase1(nb):
     if 'WARMUP_STEPS' in text:
         text = text.replace(WARMUP_NEW, WARMUP_OLD, 1)
         reverted.append('warmup')
+    if 'base_lr*min(1., warmup_step/ramp)' in text:
+        text = text.replace(WARMUP_RAMP_NEW, WARMUP_RAMP_OLD, 1)
+        reverted.append('warmup-ramp')
     if 'sentences=sents' in text:
         text = text.replace(TRAIN_EVENT_NEW, TRAIN_EVENT_OLD, 1)
         reverted.append('train-event')
@@ -456,6 +576,18 @@ def apply_phase1(nb, objective_source):
         idx = next(i for i, x in enumerate(cells) if x.get('id') == '775ed5c3')
         cells.insert(idx + 1, cell)
         changed.append('objective-cell')
+    else:
+        # The objective cell already exists (it was embedded by an earlier
+        # run). Keep its `learning_rate` policy in sync with the module: the
+        # training loop calls it, and a stale copy would silently restore the
+        # too-large learning rate that broke run 2.
+        c = _cell_by_id(nb, 'sentence-objective')
+        text = ''.join(c['source'])
+        if 'def learning_rate(' not in text:
+            text = _replace_once(text, WARMUP_STEPS_MODULE_OLD,
+                                 WARMUP_STEPS_MODULE_NEW, 'learning_rate')
+            _set_source(c, text)
+            changed.append('learning_rate')
 
     # ---- 4. training helper cell: prose_backward + train_prose_batch ------
     c = _cell_by_id(nb, 'f997eb16')
@@ -471,11 +603,21 @@ def apply_phase1(nb, objective_source):
     if 'sentence_step' not in text:
         text = _replace_once(text, TRAIN_BATCH_OLD, TRAIN_BATCH_NEW, 'train_prose_batch')
         changed.append('train_prose_batch')
-    if 'WARMUP_STEPS' not in text:
-        text = _replace_once(text, WARMUP_OLD, WARMUP_NEW, 'warmup')
-        changed.append('warmup')
+    # The warm-up ramp has three historical forms. Upgrade whichever one is
+    # present straight to the final policy (ramp length AND base learning
+    # rate, both derived from where the weights came from).
+    if 'base_lr*min(1., warmup_step/ramp)' not in text:
+        for old, label in ((WARMUP_RAMP_OLD_ONLY, 'warmup-ramp-lr'),
+                           (WARMUP_RAMP_OLD, 'warmup-ramp'),
+                           (WARMUP_NEW, 'warmup-lr'),
+                           (WARMUP_OLD, 'warmup')):
+            if old in text:
+                text = _replace_once(text, old, WARMUP_RAMP_NEW, label)
+                changed.append(label)
+                break
+        else:
+            raise RuntimeError('Could not find any known warm-up form in the notebook.')
     _set_source(c, text)
-
     # ---- 6. evaluation cell: sentence accuracy + selection ------------------
     c = _cell_by_id(nb, 'd1eb119d')
     text = ''.join(c['source'])

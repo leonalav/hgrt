@@ -54,19 +54,53 @@ def _last_byte_nll(model, context):
 
 
 def bpb_by_context(model, data, lengths=(64, 128, 256, 512, 1024, 2048),
-                   windows=40, offset=50000):
+                   windows=40, offset=50000, paired=True):
     """Held-out BPB as a function of the context window length.
 
     The model was trained at one context length; this shows how much BPB
     improves if it were given more or less context. A saturating curve means
     the memory system is not the bottleneck.
+
+    CONTENT IS HELD FIXED (W9).  The naive version of this probe walked a
+    different byte range for every length, so a change in BPB between two
+    lengths conflated "more context" with "different text" -- and the text
+    dominates: adjacent passages have quite different intrinsic difficulty.
+
+    With `paired=True` (the default) every length is scored on the SAME
+    `windows` byte ranges, all starting at `offset` and advancing in strides
+    of the LONGEST length.  The shorter windows are prefixes of the longer
+    ones, so the curve isolates the effect of the context length itself.
+
+    With `paired=False` the original (unpaired) walk is restored, for
+    comparison with previously reported numbers.
     """
     out = {}
+    lengths = tuple(lengths)
+    if not lengths:
+        return out
+    longest = max(lengths)
+    if paired:
+        # One fixed set of start offsets for every length.  The stride is the
+        # LONGEST length so the windows never overlap and cover the same
+        # region of the corpus for every length.
+        if offset + windows * longest + 1 > len(data):
+            longest = max((l for l in lengths
+                           if offset + windows * l + 1 <= len(data)), default=0)
+            if not longest:
+                return out
+        starts = offset + np.arange(windows) * longest
     for length in lengths:
-        if offset + windows * length + 1 > len(data):
-            continue
-        starts = np.arange(offset, offset + windows * length, length)
-        blocks = np.stack([data[s:s + length + 1] for s in starts])
+        if paired:
+            if offset + windows * longest + 1 > len(data):
+                continue
+            if length > longest:
+                continue
+            use = starts
+        else:
+            if offset + windows * length + 1 > len(data):
+                continue
+            use = np.arange(offset, offset + windows * length, length)
+        blocks = np.stack([data[s:s + length + 1] for s in use])
         x = torch.from_numpy(blocks[:, :-1]).long()
         y = torch.from_numpy(blocks[:, 1:]).long()
         with torch.inference_mode():

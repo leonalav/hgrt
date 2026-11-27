@@ -49,8 +49,10 @@ class AnchorTests(unittest.TestCase):
     def test_train_batch_anchor_exists(self):
         text = cell_text(self.nb, '69ac46a1')
         self.assertIn(P.TRAIN_BATCH_OLD, text)
-        self.assertIn(P.WARMUP_OLD, text)
-
+        # The pre-Phase-1 notebook divides by the constant `WARMUP_STEPS`.
+        # `P.WARMUP_OLD` (the `/50` form) is a HISTORICAL anchor from an
+        # earlier commit and is not present in the current notebook.
+        self.assertIn(P.WARMUP_RAMP_OLD, text)
     def test_evaluation_anchors_exist(self):
         text = cell_text(self.nb, 'd1eb119d')
         self.assertIn(P.KEEP_BEST_OLD, text)
@@ -96,10 +98,29 @@ class ApplyTests(unittest.TestCase):
         self.assertIn('sentence_anchors', cell_text(nb, '5dda70a4'))
         self.assertIn('sentence=None', cell_text(nb, 'f997eb16'))
         self.assertIn('sentence_step', cell_text(nb, '69ac46a1'))
-        self.assertIn('WARMUP_STEPS', cell_text(nb, '69ac46a1'))
         self.assertIn('def evaluate_sentences', cell_text(nb, 'd1eb119d'))
         self.assertIn('selection_score(', cell_text(nb, 'd1eb119d'))
         self.assertTrue(any(c.get('id') == 'sentence-objective' for c in nb['cells']))
+
+    def test_apply_installs_the_learning_rate_policy(self):
+        """The ramp length AND the base LR must come from the policy.
+
+        The constant `WARMUP_STEPS` divided the ramp in every case, so a run
+        seeded from a converged checkpoint spent its first 1000 steps ramping
+        into a learning rate 5-25x too large for that checkpoint.  The policy
+        functions `warmup_steps()` and `learning_rate()` replace it.
+        """
+        nb = load()
+        P.revert_phase1(nb)
+        P.apply_phase1(nb, objective_source())
+        train = cell_text(nb, '69ac46a1')
+        self.assertIn('warmup_steps(resume_path, INITIAL_WEIGHTS)', train)
+        self.assertIn('learning_rate(resume_path, INITIAL_WEIGHTS)', train)
+        self.assertIn('base_lr*min(1., warmup_step/ramp)', train)
+        # The objective cell must carry the policy implementation.
+        obj = cell_text(nb, 'sentence-objective')
+        self.assertIn('def learning_rate(', obj)
+        self.assertIn('def warmup_steps(', obj)
 
     def test_the_objective_cell_does_not_redefine_settings(self):
         nb = load()
